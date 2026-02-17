@@ -141,11 +141,23 @@ DEFAULT_STATE = {
     'word_count': 0,
     'history': [],
     'input_mode': 'file',
+    'debug_logs': [],
 }
 
 for key, default_value in DEFAULT_STATE.items():
     if key not in st.session_state:
         st.session_state[key] = default_value
+
+def log_debug(message: str):
+    """Add a message to the debug log."""
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    entry = f"[{ts}] {message}"
+    if 'debug_logs' not in st.session_state:
+        st.session_state.debug_logs = []
+    st.session_state.debug_logs.append(entry)
+    # Keep only last 50 logs
+    if len(st.session_state.debug_logs) > 50:
+        st.session_state.debug_logs.pop(0)
 
 # ============================================================
 # Language Configuration
@@ -199,6 +211,7 @@ def normalize_endpoint(endpoint: str, default_scheme: str = "http") -> str:
         else:
             endpoint = f"http://{endpoint}"
     
+    # Remove trailing slash
     return endpoint.rstrip('/')
 
 
@@ -375,17 +388,24 @@ def transcribe_audio(audio_data: bytes, endpoint: str, model: str, language: Opt
     cached_path = st.session_state.get(cache_key)
 
     # Try different API paths (prioritize cached one)
+    # Be smart about /v1 prefix
     api_paths = [
-        "/v1/audio/transcriptions",  # OpenAI-compatible
-        "/audio/transcriptions",      # Alternative
+        "/v1/audio/transcriptions",  # OpenAI-compatible (standard)
+        "/audio/transcriptions",      # Alternative (if base url already has /v1)
         "/transcribe",                # Simple
     ]
     
+    # If the user put /v1 in the endpoint, we should prioritize the path that doesn't duplicate it
+    if endpoint.endswith('/v1'):
+        api_paths = ["/audio/transcriptions", "/v1/audio/transcriptions", "/transcribe"]
+
     if cached_path and cached_path in api_paths:
         api_paths.remove(cached_path)
         api_paths.insert(0, cached_path)
 
     last_error = "Could not connect to Whisper API"
+
+    log_debug(f"Starting transcription. Endpoint: {endpoint}, Model: {model}")
 
     for api_path in api_paths:
         try:
@@ -394,7 +414,15 @@ def transcribe_audio(audio_data: bytes, endpoint: str, model: str, language: Opt
             # Define potential model names to try if the primary one fails
             # We try the detected model first, then common aliases if rejected
             candidate_models = [model]
-            fallback_list = ['whisper-1', 'whisper', 'large-v3', 'openai/whisper-large-v3', 'distil-whisper/distil-large-v3']
+            fallback_list = [
+                'whisper-1',
+                'whisper',
+                'large-v3',
+                'openai/whisper-large-v3',
+                'distil-whisper/distil-large-v3',
+                'nvidia/whisper-large-v3', # NIM style
+                'nvidia/whisper'
+            ]
             for m in fallback_list:
                 if m not in candidate_models:
                     candidate_models.append(m)
@@ -413,10 +441,12 @@ def transcribe_audio(audio_data: bytes, endpoint: str, model: str, language: Opt
                 data["response_format"] = "json"
 
                 try:
+                    log_debug(f"Attempting POST {url} with model={attempt_model}")
                     response = session.post(url, files=files, data=data, timeout=300) # Longer timeout for large files
                     latency = (time.time() - start_time) * 1000
 
                     if response.status_code == 200:
+                        log_debug(f"Success! Latency: {latency:.0f}ms")
                         # Cache the working path
                         st.session_state[cache_key] = api_path
 
@@ -437,10 +467,13 @@ def transcribe_audio(audio_data: bytes, endpoint: str, model: str, language: Opt
                             return transcript.strip(), latency, ""
 
                     # Capture error
-                    last_error = f"Error ({response.status_code}): {response.text[:200]}"
+                    error_detail = response.text[:200]
+                    last_error = f"Error ({response.status_code}): {error_detail}"
+                    log_debug(f"Failed ({response.status_code}): {error_detail}")
 
                     # If 400 Bad Request regarding model, try next candidate
                     if response.status_code == 400 and ("model" in response.text.lower() or "bad request" in response.text.lower()):
+                        log_debug("Model name rejected, retrying with next candidate...")
                         continue
 
                     # If 404, break inner loop to try next API path
@@ -743,6 +776,14 @@ def render_sidebar():
             'do_summary': do_summary
         }
 
+def render_debug_logs():
+    with st.expander("🐛 Debug Logs", expanded=False):
+        if st.button("Clear Logs"):
+            st.session_state.debug_logs = []
+            st.rerun()
+
+        logs = "\n".join(reversed(st.session_state.get('debug_logs', [])))
+        st.code(logs, language="text")
 
 def render_metrics():
     if not st.session_state.transcript:
@@ -1015,6 +1056,7 @@ def main():
     
     with tab1:
         render_main(options)
+        render_debug_logs()
     with tab2:
         render_history()
     with tab3:
