@@ -1,0 +1,18 @@
+{{- if .Values.ezua.enabled }}
+{{- $fullName := .Values.appName | default "speech-ai" -}}
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: {{ $fullName }}-dr
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ $fullName }}
+spec:
+  host: {{ $fullName }}-service.{{ .Release.Namespace }}.svc.cluster.local
+  trafficPolicy:
+    connectionPool:
+      http:
+        h2UpgradePolicy: DO_NOT_UPGRADE
+        http1MaxPendingRequests: 1024
+        http2MaxRequests: 1024
+{{- end }}

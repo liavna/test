@@ -1,0 +1,69 @@
+image:
+  repository: liavna/speech-ai
+  tag: latest
+  pullPolicy: Always
+
+service:
+  port: 8501
+
+appName: speech-ai
+
+replicaCount: 1
+
+resources:
+  requests:
+    memory: "256Mi"
+    cpu: "100m"
+  limits:
+    memory: "1Gi"
+    cpu: "1000m"
+
+ezua:
+  enabled: true
+  virtualService:
+    endpoint: "speech-ai.${DOMAIN_NAME}"
+    istioGateway: "istio-system/ezaf-gateway"
+  applicationName: "speech-ai"
+  ingressHost: "speech-ai.ingress.pcai.hpelabs.co.il"
+  gateway: "istio-system/ezaf-gateway"
+  authPolicy:
+    enabled: false
+
+istioSidecar:
+  enabled: true
+
+probes:
+  liveness:
+    enabled: true
+    path: /_stcore/health
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 5
+  readiness:
+    enabled: true
+    path: /_stcore/health
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+imagePullSecrets: []
+env: []

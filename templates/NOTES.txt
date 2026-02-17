@@ -1,0 +1,96 @@
+============================================================
+🎙️ Speech.AI v2.0 - Live Demo Edition
+============================================================
+
+Thank you for installing {{ .Chart.Name }}!
+
+Chart Version: {{ .Chart.Version }}
+App Version:   {{ .Chart.AppVersion }}
+
+============================================================
+🌐 ACCESS YOUR APPLICATION
+============================================================
+
+{{- if .Values.ezua.enabled }}
+
+Your application is exposed via EZUA/Istio:
+
+{{- if .Values.ezua.virtualService }}
+  🔗 Endpoint: https://{{ .Values.ezua.virtualService.endpoint }}
+  🚪 Gateway: {{ .Values.ezua.virtualService.istioGateway }}
+{{- else }}
+  🔗 URL: https://{{ .Values.ezua.ingressHost }}
+  🚪 Gateway: {{ .Values.ezua.gateway }}
+{{- end }}
+
+Note: If using ${DOMAIN_NAME}, it will be replaced by EZUA system.
+
+{{- else }}
+
+To access your application, use port-forwarding:
+
+  kubectl port-forward svc/{{ .Values.appName }}-service {{ .Values.service.port }}:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+
+Then open: http://localhost:{{ .Values.service.port }}
+
+{{- end }}
+
+============================================================
+🎯 DEMO QUICK START
+============================================================
+
+1. Open the Speech.AI UI in your browser
+
+2. Enable "🎭 Demo Mode" to see a simulated Greek conversation
+   (Works without microphone - perfect for presentations!)
+
+3. Or configure real endpoints:
+   - Whisper/STT Endpoint: Your MLIS Whisper URL
+   - Qwen/LLM Endpoint: Your MLIS Qwen URL  
+   - MLIS API Token: Your authentication token
+
+4. Click "🔌 Connect & Detect Models" to discover available models
+
+5. Record or upload audio and click "🚀 Process Audio"
+
+============================================================
+🇬🇷 GREEK DEMO FEATURES
+============================================================
+
+- Greek language is first in the language list
+- Demo mode shows a simulated Greek customer service call
+- Speaker labels in Greek: Πελάτης (Customer), Πράκτορας (Agent)
+- Color-coded speakers for visual clarity
+
+============================================================
+🔧 USEFUL COMMANDS
+============================================================
+
+# Check pod status
+kubectl get pods -l app={{ .Values.appName }} -n {{ .Release.Namespace }}
+
+# View logs
+kubectl logs -l app={{ .Values.appName }} -n {{ .Release.Namespace }} -c {{ .Values.appName }} -f
+
+# Check service
+kubectl get svc {{ .Values.appName }}-service -n {{ .Release.Namespace }}
+
+{{- if .Values.ezua.enabled }}
+# Check VirtualService
+kubectl get virtualservice {{ .Values.appName }}-vs -n {{ .Release.Namespace }}
+
+# Verify endpoint
+kubectl get virtualservice {{ .Values.appName }}-vs -n {{ .Release.Namespace }} -o jsonpath='{.spec.hosts[0]}'
+{{- end }}
+
+# Port-forward for local testing
+kubectl port-forward svc/{{ .Values.appName }}-service 8501:8501 -n {{ .Release.Namespace }}
+
+============================================================
+📚 DOCUMENTATION
+============================================================
+
+For more information, visit:
+https://github.com/liavna
+
+============================================================

@@ -1,0 +1,37 @@
+{{- if .Values.ezua.enabled }}
+{{- $fullName := .Values.appName | default "speech-ai" -}}
+{{- $endpoint := "" -}}
+{{- if .Values.ezua.virtualService -}}
+{{- $endpoint = .Values.ezua.virtualService.endpoint -}}
+{{- else -}}
+{{- $endpoint = .Values.ezua.ingressHost | default (printf "%s.ingress.pcai.hpelabs.co.il" $fullName) -}}
+{{- end -}}
+{{- $gateway := "" -}}
+{{- if .Values.ezua.virtualService -}}
+{{- $gateway = .Values.ezua.virtualService.istioGateway -}}
+{{- else -}}
+{{- $gateway = .Values.ezua.gateway | default "istio-system/ezaf-gateway" -}}
+{{- end -}}
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: {{ $fullName }}-vs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ $fullName }}
+spec:
+  hosts:
+    - {{ $endpoint | quote }}
+  gateways:
+    - {{ $gateway | quote }}
+  http:
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: {{ $fullName }}-service.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.service.port }}
+      timeout: 300s
+{{- end }}
