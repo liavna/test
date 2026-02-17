@@ -369,7 +369,7 @@ def transcribe_audio(audio_data: bytes, endpoint: str, model: str, language: Opt
     
     endpoint = normalize_endpoint(endpoint, "http")
     session = get_session()
-    
+
     # Check if we have a cached working path for this endpoint
     cache_key = f"whisper_path_{endpoint}"
     cached_path = st.session_state.get(cache_key)
@@ -388,45 +388,63 @@ def transcribe_audio(audio_data: bytes, endpoint: str, model: str, language: Opt
     for api_path in api_paths:
         try:
             url = f"{endpoint}{api_path}"
-            files = {"file": ("audio.wav", audio_data, "audio/wav")}
-            data = {"model": model}
             
-            # Add language if specified
-            if language:
-                data["language"] = language
-            
-            # Some APIs want response_format
-            data["response_format"] = "json"
-            
-            response = session.post(url, files=files, data=data, timeout=300) # Longer timeout for large files
-            latency = (time.time() - start_time) * 1000
-            
-            if response.status_code == 200:
-                # Cache the working path
-                st.session_state[cache_key] = api_path
+            # Define potential model names to try if the primary one fails
+            # We try the detected model first, then common aliases if rejected
+            candidate_models = [model]
+            if model not in ['whisper-1', 'whisper', 'large-v3']:
+                 candidate_models.extend(['whisper-1', 'whisper', 'large-v3'])
 
-                try:
-                    result = response.json()
-                    # Handle different response formats
-                    transcript = (
-                        result.get('text') or 
-                        result.get('transcript') or 
-                        result.get('transcription') or
-                        result.get('result', {}).get('text') or
-                        ''
-                    )
-                except:
-                    transcript = response.text
+            for attempt_model in candidate_models:
+                # Re-create files for each attempt because reading might consume the stream if it were a file object
+                # (though here audio_data is bytes so it's fine)
+                files = {"file": ("audio.wav", audio_data, "audio/wav")}
+                data = {"model": attempt_model}
+
+                # Add language if specified
+                if language:
+                    data["language"] = language
+
+                # Some APIs want response_format
+                data["response_format"] = "json"
+
+                response = session.post(url, files=files, data=data, timeout=300) # Longer timeout for large files
+                latency = (time.time() - start_time) * 1000
+
+                if response.status_code == 200:
+                    # Cache the working path
+                    st.session_state[cache_key] = api_path
+
+                    try:
+                        result = response.json()
+                        # Handle different response formats
+                        transcript = (
+                            result.get('text') or
+                            result.get('transcript') or
+                            result.get('transcription') or
+                            result.get('result', {}).get('text') or
+                            ''
+                        )
+                    except:
+                        transcript = response.text
+
+                    if transcript:
+                        return transcript.strip(), latency, ""
+
+                # If 400 Bad Request regarding model, try next candidate
+                if response.status_code == 400 and ("model" in response.text.lower() or "bad request" in response.text.lower()):
+                    continue
                 
-                if transcript:
-                    return transcript.strip(), latency, ""
+                # If 404, break inner loop to try next API path
+                if response.status_code == 404:
+                    break
+
+                # Other errors - return immediately
+                return "", latency, f"Error ({response.status_code}): {response.text[:200]}"
             
-            # If 404, try next path
             if response.status_code == 404:
                 continue
-                
-            return "", latency, f"Error ({response.status_code}): {response.text[:200]}"
-            
+
         except requests.exceptions.ConnectionError:
             continue
         except Exception as e:
