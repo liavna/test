@@ -385,6 +385,8 @@ def transcribe_audio(audio_data: bytes, endpoint: str, model: str, language: Opt
         api_paths.remove(cached_path)
         api_paths.insert(0, cached_path)
 
+    last_error = "Could not connect to Whisper API"
+
     for api_path in api_paths:
         try:
             url = f"{endpoint}{api_path}"
@@ -392,8 +394,10 @@ def transcribe_audio(audio_data: bytes, endpoint: str, model: str, language: Opt
             # Define potential model names to try if the primary one fails
             # We try the detected model first, then common aliases if rejected
             candidate_models = [model]
-            if model not in ['whisper-1', 'whisper', 'large-v3']:
-                 candidate_models.extend(['whisper-1', 'whisper', 'large-v3'])
+            fallback_list = ['whisper-1', 'whisper', 'large-v3', 'openai/whisper-large-v3', 'distil-whisper/distil-large-v3']
+            for m in fallback_list:
+                if m not in candidate_models:
+                    candidate_models.append(m)
 
             for attempt_model in candidate_models:
                 # Re-create files for each attempt because reading might consume the stream if it were a file object
@@ -408,49 +412,64 @@ def transcribe_audio(audio_data: bytes, endpoint: str, model: str, language: Opt
                 # Some APIs want response_format
                 data["response_format"] = "json"
 
-                response = session.post(url, files=files, data=data, timeout=300) # Longer timeout for large files
-                latency = (time.time() - start_time) * 1000
+                try:
+                    response = session.post(url, files=files, data=data, timeout=300) # Longer timeout for large files
+                    latency = (time.time() - start_time) * 1000
 
-                if response.status_code == 200:
-                    # Cache the working path
-                    st.session_state[cache_key] = api_path
+                    if response.status_code == 200:
+                        # Cache the working path
+                        st.session_state[cache_key] = api_path
 
-                    try:
-                        result = response.json()
-                        # Handle different response formats
-                        transcript = (
-                            result.get('text') or
-                            result.get('transcript') or
-                            result.get('transcription') or
-                            result.get('result', {}).get('text') or
-                            ''
-                        )
-                    except:
-                        transcript = response.text
+                        try:
+                            result = response.json()
+                            # Handle different response formats
+                            transcript = (
+                                result.get('text') or
+                                result.get('transcript') or
+                                result.get('transcription') or
+                                result.get('result', {}).get('text') or
+                                ''
+                            )
+                        except:
+                            transcript = response.text
 
-                    if transcript:
-                        return transcript.strip(), latency, ""
+                        if transcript:
+                            return transcript.strip(), latency, ""
 
-                # If 400 Bad Request regarding model, try next candidate
-                if response.status_code == 400 and ("model" in response.text.lower() or "bad request" in response.text.lower()):
+                    # Capture error
+                    last_error = f"Error ({response.status_code}): {response.text[:200]}"
+
+                    # If 400 Bad Request regarding model, try next candidate
+                    if response.status_code == 400 and ("model" in response.text.lower() or "bad request" in response.text.lower()):
+                        continue
+
+                    # If 404, break inner loop to try next API path
+                    if response.status_code == 404:
+                        break
+
+                    # Other errors - try next model (maybe wrong param for this model?) or break?
+                    # Generally continue to next model just in case, or break?
+                    # If 500, maybe break.
+                    if response.status_code >= 500:
+                        break
+
+                except Exception as e:
+                    last_error = str(e)
                     continue
-                
-                # If 404, break inner loop to try next API path
-                if response.status_code == 404:
-                    break
 
-                # Other errors - return immediately
-                return "", latency, f"Error ({response.status_code}): {response.text[:200]}"
+            # If 404, try next API path
+            # But if we had a non-404 error (captured in last_error), we probably found the right path but failed requests
+            # So if we got a 400, we should probably stop unless we're really unsure about the path.
+            # However, for robustness, we continue iterating paths if we haven't found a 200.
+            # The last_error will hold the most recent failure.
             
-            if response.status_code == 404:
-                continue
-
         except requests.exceptions.ConnectionError:
             continue
         except Exception as e:
-            return "", (time.time() - start_time) * 1000, str(e)
+            last_error = str(e)
+            continue
     
-    return "", (time.time() - start_time) * 1000, "Could not connect to Whisper API"
+    return "", (time.time() - start_time) * 1000, last_error
 
 
 def perform_diarization(transcript: str, endpoint: str, token: str, model: str, 
