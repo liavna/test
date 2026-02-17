@@ -407,13 +407,59 @@ def transcribe_audio(audio_data: bytes, endpoint: str, model: str, language: Opt
 
     log_debug(f"Starting transcription. Endpoint: {endpoint}, Model: {model}")
 
+    # FORCE MODEL DISCOVERY: Try to list models first to get the EXACT ID
+    discovered_models = []
+    try:
+        # Try a few common model list endpoints
+        list_paths = ["/v1/models", "/models"]
+        if endpoint.endswith('/v1'):
+             list_paths = ["/models", "/v1/models"] # relative to base
+
+        for list_path in list_paths:
+            list_url = f"{endpoint}{list_path}"
+            log_debug(f"Probing model list at {list_url}...")
+            try:
+                resp = session.get(list_url, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    log_debug(f"Model list response: {json.dumps(data)}")
+
+                    if 'data' in data and isinstance(data['data'], list):
+                        discovered_models = [m['id'] for m in data['data'] if 'id' in m]
+                    elif 'models' in data:
+                        discovered_models = data['models']
+                    elif isinstance(data, list):
+                        discovered_models = data
+
+                    if discovered_models:
+                        log_debug(f"Discovered valid models: {discovered_models}")
+                        break
+            except Exception as e:
+                log_debug(f"Model list probe failed: {e}")
+                continue
+    except Exception as e:
+        log_debug(f"Error during model discovery: {e}")
+
     for api_path in api_paths:
         try:
             url = f"{endpoint}{api_path}"
             
             # Define potential model names to try if the primary one fails
-            # We try the detected model first, then common aliases if rejected
-            candidate_models = [model]
+            # Priority:
+            # 1. Discovered models (from live API)
+            # 2. User selected model
+            # 3. Common fallbacks
+
+            candidate_models = []
+
+            # Add discovered models first
+            if discovered_models:
+                candidate_models.extend(discovered_models)
+
+            # Add user selected model if not already there
+            if model not in candidate_models:
+                candidate_models.append(model)
+
             fallback_list = [
                 'whisper-1',
                 'whisper',
@@ -421,7 +467,9 @@ def transcribe_audio(audio_data: bytes, endpoint: str, model: str, language: Opt
                 'openai/whisper-large-v3',
                 'distil-whisper/distil-large-v3',
                 'nvidia/whisper-large-v3', # NIM style
-                'nvidia/whisper'
+                'nvidia/whisper',
+                'nvcr.io/nim/nvidia/whisper-large-v3:1.4.0', # Full image tag
+                'whisper-large-v3:1.4.0'
             ]
             for m in fallback_list:
                 if m not in candidate_models:
