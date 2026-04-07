@@ -2,7 +2,7 @@
 Speech.AI - Live Transcription, Diarization & Summary
 Powered by HPE Private Cloud AI with Whisper ASR and Qwen LLM
 
-🎯 Version 3.0 - Full Featured Demo Edition
+🎯 Version 3.1 - High Performance Edition
 """
 import streamlit as st
 import requests
@@ -10,8 +10,11 @@ import json
 import time
 import urllib3
 import os
+import re
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ============================================================
 # SSL Configuration - Disable verification
@@ -23,7 +26,7 @@ os.environ['REQUESTS_CA_BUNDLE'] = ''
 # ============================================================
 # Configuration
 # ============================================================
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 APP_TITLE = "🎙️ Speech.AI"
 APP_SUBTITLE = "Live Transcription & Diarization"
 
@@ -138,11 +141,23 @@ DEFAULT_STATE = {
     'word_count': 0,
     'history': [],
     'input_mode': 'file',
+    'debug_logs': [],
 }
 
 for key, default_value in DEFAULT_STATE.items():
     if key not in st.session_state:
         st.session_state[key] = default_value
+
+def log_debug(message: str):
+    """Add a message to the debug log."""
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    entry = f"[{ts}] {message}"
+    if 'debug_logs' not in st.session_state:
+        st.session_state.debug_logs = []
+    st.session_state.debug_logs.append(entry)
+    # Keep only last 50 logs
+    if len(st.session_state.debug_logs) > 50:
+        st.session_state.debug_logs.pop(0)
 
 # ============================================================
 # Language Configuration
@@ -168,6 +183,19 @@ SUPPORTED_LANGUAGES = {
 # ============================================================
 # Helper Functions
 # ============================================================
+def get_session():
+    """Get a cached session with connection pooling."""
+    if 'request_session' not in st.session_state:
+        session = requests.Session()
+        # Retry strategy
+        retries = Retry(total=3, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        session.verify = False
+        st.session_state['request_session'] = session
+    return st.session_state['request_session']
+
 def normalize_endpoint(endpoint: str, default_scheme: str = "http") -> str:
     """Ensure endpoint has a scheme (http/https)."""
     if not endpoint:
@@ -183,6 +211,7 @@ def normalize_endpoint(endpoint: str, default_scheme: str = "http") -> str:
         else:
             endpoint = f"http://{endpoint}"
     
+    # Remove trailing slash
     return endpoint.rstrip('/')
 
 
@@ -228,45 +257,97 @@ def format_diarized_html(text: str) -> str:
     
     return '\n'.join(html_parts)
 
+def extract_model_from_url(url: str) -> Optional[str]:
+    """Try to extract model name from the URL string."""
+    # Look for patterns like whisper-large-v3, whisper-medium, etc.
+    match = re.search(r'(whisper-[\w\-\.]+?)(?:-predictor|-deployment|\.|$)', url)
+    if match:
+        return match.group(1)
+    return None
 
 # ============================================================
 # API Functions
 # ============================================================
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_whisper_models(endpoint: str) -> Tuple[List[str], str]:
-    """Fetch Whisper models (NO TOKEN) - with fallback."""
+    """Fetch Whisper models with robust detection and fallback."""
     if not endpoint:
         return [], "Missing endpoint"
     
     endpoint = normalize_endpoint(endpoint, "http")
+    session = get_session()
     
-    # Try different model list endpoints
-    api_paths = ["/v1/models", "/models", "/"]
-    
-    for api_path in api_paths:
+    found_models = []
+    error_msg = ""
+
+    # Strategy 1: OpenAI Compatible /v1/models
+    try:
+        url = f"{endpoint}/v1/models"
+        response = session.get(url, timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            if 'data' in data:
+                found_models = [m.get('id', m.get('name', 'unknown')) for m in data['data']]
+            elif 'models' in data:
+                found_models = data['models']
+    except Exception as e:
+        error_msg = str(e)
+
+    # Strategy 2: Simple /models or KServe
+    if not found_models:
         try:
-            url = f"{endpoint}{api_path}"
-            response = requests.get(url, timeout=10, verify=False)
-            
+            url = f"{endpoint}/models"
+            response = session.get(url, timeout=3)
             if response.status_code == 200:
-                try:
-                    data = response.json()
-                    if 'data' in data:
-                        return [m.get('id', m.get('name', 'unknown')) for m in data['data']], ""
-                    elif 'models' in data:
-                        return data['models'], ""
-                    elif isinstance(data, list):
-                        return data, ""
-                except:
-                    pass
-            
-            if response.status_code == 404:
-                continue
-                
+                data = response.json()
+                if isinstance(data, list):
+                    found_models = data
+                elif 'models' in data:
+                    found_models = data['models']
         except:
-            continue
-    
-    # Fallback - assume whisper-large-v3 is available
-    return ['whisper-large-v3'], "Model list unavailable, using default"
+            pass
+
+    # Strategy 3: Check Health/Live + URL Extraction
+    # If we can't list models but the server is up, we try to guess the model from the URL
+    if not found_models:
+        try:
+            # Check liveness
+            is_live = False
+            for path in ["/health", "/v2/health/live", "/v2/health/ready"]:
+                try:
+                    resp = session.get(f"{endpoint}{path}", timeout=2)
+                    if resp.status_code == 200:
+                        is_live = True
+                        break
+                except:
+                    continue
+            
+            if is_live:
+                # If server is live but didn't return models, extract from URL
+                inferred = extract_model_from_url(endpoint)
+                if inferred:
+                    found_models = [inferred]
+                    error_msg = f"Inferred from URL: {inferred}"
+                else:
+                    # Generic fallback if live
+                    found_models = ['whisper-large-v3']
+                    error_msg = "Server live, using default"
+        except:
+            pass
+
+    # Final Fallback
+    if not found_models:
+        # One last ditch effort: extract from URL even if we couldn't connect (maybe DNS/Network issue but user knows it's right)
+        # Actually, let's only do this if we want to be very optimistic.
+        # But better to show connection error.
+        # However, for the specific user request "find out which model is running there", extraction is key.
+        inferred = extract_model_from_url(endpoint)
+        if inferred:
+             return [inferred], "Could not connect, but identified model from URL"
+
+        return ['whisper-large-v3'], error_msg or "Could not detect models"
+
+    return found_models, error_msg
 
 
 def fetch_qwen_models(endpoint: str, token: str) -> Tuple[List[str], str]:
@@ -275,13 +356,14 @@ def fetch_qwen_models(endpoint: str, token: str) -> Tuple[List[str], str]:
         return [], "Missing endpoint or token"
     
     endpoint = normalize_endpoint(endpoint, "https")
+    session = get_session()
     
     try:
         # Remove /v1 suffix if present for models endpoint
         base = endpoint.replace('/v1', '')
         url = f"{base}/v1/models"
         headers = {"Authorization": f"Bearer {token}"}
-        response = requests.get(url, headers=headers, timeout=10, verify=False)
+        response = session.get(url, headers=headers, timeout=5)
         if response.status_code == 200:
             data = response.json()
             if 'data' in data:
@@ -298,61 +380,177 @@ def transcribe_audio(audio_data: bytes, endpoint: str, model: str, language: Opt
     """Transcribe audio (NO TOKEN) - supports various Whisper API formats."""
     start_time = time.time()
     
-    # Normalize endpoint
     endpoint = normalize_endpoint(endpoint, "http")
-    
-    # Try different API paths
+    session = get_session()
+
+    # Check if we have a cached working path for this endpoint
+    cache_key = f"whisper_path_{endpoint}"
+    cached_path = st.session_state.get(cache_key)
+
+    # Try different API paths (prioritize cached one)
+    # Be smart about /v1 prefix
     api_paths = [
-        "/v1/audio/transcriptions",  # OpenAI-compatible
-        "/audio/transcriptions",      # Alternative
+        "/v1/audio/transcriptions",  # OpenAI-compatible (standard)
+        "/audio/transcriptions",      # Alternative (if base url already has /v1)
         "/transcribe",                # Simple
     ]
     
+    # If the user put /v1 in the endpoint, we should prioritize the path that doesn't duplicate it
+    if endpoint.endswith('/v1'):
+        api_paths = ["/audio/transcriptions", "/v1/audio/transcriptions", "/transcribe"]
+
+    if cached_path and cached_path in api_paths:
+        api_paths.remove(cached_path)
+        api_paths.insert(0, cached_path)
+
+    last_error = "Could not connect to Whisper API"
+
+    log_debug(f"Starting transcription. Endpoint: {endpoint}, Model: {model}")
+
+    # FORCE MODEL DISCOVERY: Try to list models first to get the EXACT ID
+    discovered_models = []
+    try:
+        # Try a few common model list endpoints
+        list_paths = ["/v1/models", "/models"]
+        if endpoint.endswith('/v1'):
+             list_paths = ["/models", "/v1/models"] # relative to base
+
+        for list_path in list_paths:
+            list_url = f"{endpoint}{list_path}"
+            log_debug(f"Probing model list at {list_url}...")
+            try:
+                resp = session.get(list_url, timeout=5)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    log_debug(f"Model list response: {json.dumps(data)}")
+
+                    if 'data' in data and isinstance(data['data'], list):
+                        discovered_models = [m['id'] for m in data['data'] if 'id' in m]
+                    elif 'models' in data:
+                        discovered_models = data['models']
+                    elif isinstance(data, list):
+                        discovered_models = data
+
+                    if discovered_models:
+                        log_debug(f"Discovered valid models: {discovered_models}")
+                        break
+            except Exception as e:
+                log_debug(f"Model list probe failed: {e}")
+                continue
+    except Exception as e:
+        log_debug(f"Error during model discovery: {e}")
+
     for api_path in api_paths:
         try:
             url = f"{endpoint}{api_path}"
-            files = {"file": ("audio.wav", audio_data, "audio/wav")}
-            data = {"model": model}
             
-            # Add language if specified
-            if language:
-                data["language"] = language
-            
-            # Some APIs want response_format
-            data["response_format"] = "json"
-            
-            response = requests.post(url, files=files, data=data, timeout=120, verify=False)
-            latency = (time.time() - start_time) * 1000
-            
-            if response.status_code == 200:
+            # Define potential model names to try if the primary one fails
+            # Priority:
+            # 1. Discovered models (from live API)
+            # 2. User selected model
+            # 3. Common fallbacks
+
+            candidate_models = []
+
+            # Add discovered models first
+            if discovered_models:
+                candidate_models.extend(discovered_models)
+
+            # Add user selected model if not already there
+            if model not in candidate_models:
+                candidate_models.append(model)
+
+            fallback_list = [
+                'whisper-1',
+                'whisper',
+                'large-v3',
+                'openai/whisper-large-v3',
+                'distil-whisper/distil-large-v3',
+                'nvidia/whisper-large-v3', # NIM style
+                'nvidia/whisper',
+                'nvcr.io/nim/nvidia/whisper-large-v3:1.4.0', # Full image tag
+                'whisper-large-v3:1.4.0'
+            ]
+            for m in fallback_list:
+                if m not in candidate_models:
+                    candidate_models.append(m)
+
+            for attempt_model in candidate_models:
+                # Re-create files for each attempt because reading might consume the stream if it were a file object
+                # (though here audio_data is bytes so it's fine)
+                files = {"file": ("audio.wav", audio_data, "audio/wav")}
+                data = {"model": attempt_model}
+
+                # Add language if specified
+                if language:
+                    data["language"] = language
+
+                # Some APIs want response_format
+                data["response_format"] = "json"
+
                 try:
-                    result = response.json()
-                    # Handle different response formats
-                    transcript = (
-                        result.get('text') or 
-                        result.get('transcript') or 
-                        result.get('transcription') or
-                        result.get('result', {}).get('text') or
-                        ''
-                    )
-                except:
-                    transcript = response.text
-                
-                if transcript:
-                    return transcript.strip(), latency, ""
-            
-            # If 404, try next path
-            if response.status_code == 404:
-                continue
-                
-            return "", latency, f"Error ({response.status_code}): {response.text[:200]}"
+                    log_debug(f"Attempting POST {url} with model={attempt_model}")
+                    response = session.post(url, files=files, data=data, timeout=300) # Longer timeout for large files
+                    latency = (time.time() - start_time) * 1000
+
+                    if response.status_code == 200:
+                        log_debug(f"Success! Latency: {latency:.0f}ms")
+                        # Cache the working path
+                        st.session_state[cache_key] = api_path
+
+                        try:
+                            result = response.json()
+                            # Handle different response formats
+                            transcript = (
+                                result.get('text') or
+                                result.get('transcript') or
+                                result.get('transcription') or
+                                result.get('result', {}).get('text') or
+                                ''
+                            )
+                        except:
+                            transcript = response.text
+
+                        if transcript:
+                            return transcript.strip(), latency, ""
+
+                    # Capture error
+                    error_detail = response.text[:200]
+                    last_error = f"Error ({response.status_code}): {error_detail}"
+                    log_debug(f"Failed ({response.status_code}): {error_detail}")
+
+                    # If 400 Bad Request regarding model, try next candidate
+                    if response.status_code == 400 and ("model" in response.text.lower() or "bad request" in response.text.lower()):
+                        log_debug("Model name rejected, retrying with next candidate...")
+                        continue
+
+                    # If 404, break inner loop to try next API path
+                    if response.status_code == 404:
+                        break
+
+                    # Other errors - try next model (maybe wrong param for this model?) or break?
+                    # Generally continue to next model just in case, or break?
+                    # If 500, maybe break.
+                    if response.status_code >= 500:
+                        break
+
+                except Exception as e:
+                    last_error = str(e)
+                    continue
+
+            # If 404, try next API path
+            # But if we had a non-404 error (captured in last_error), we probably found the right path but failed requests
+            # So if we got a 400, we should probably stop unless we're really unsure about the path.
+            # However, for robustness, we continue iterating paths if we haven't found a 200.
+            # The last_error will hold the most recent failure.
             
         except requests.exceptions.ConnectionError:
             continue
         except Exception as e:
-            return "", (time.time() - start_time) * 1000, str(e)
+            last_error = str(e)
+            continue
     
-    return "", (time.time() - start_time) * 1000, "Could not connect to Whisper API"
+    return "", (time.time() - start_time) * 1000, last_error
 
 
 def perform_diarization(transcript: str, endpoint: str, token: str, model: str, 
@@ -361,6 +559,7 @@ def perform_diarization(transcript: str, endpoint: str, token: str, model: str,
     start_time = time.time()
     
     endpoint = normalize_endpoint(endpoint, "https")
+    session = get_session()
     
     prompts = {
         "el": """Είσαι ειδικός στην αναγνώριση ομιλητών. Ανάλυσε το κείμενο και προσδιόρισε τους ομιλητές.
@@ -396,7 +595,7 @@ Preserve text, only add labels. Each speaker turn on new line."""
             "max_tokens": 4096
         }
         
-        response = requests.post(url, headers=headers, json=payload, timeout=180, verify=False)
+        response = session.post(url, headers=headers, json=payload, timeout=180)
         latency = (time.time() - start_time) * 1000
         
         if response.status_code == 200:
@@ -412,6 +611,7 @@ def generate_summary(text: str, endpoint: str, token: str, model: str, language:
     """Generate summary (TOKEN REQUIRED)."""
     
     endpoint = normalize_endpoint(endpoint, "https")
+    session = get_session()
     
     prompts = {
         "el": "Δημιούργησε σύντομη περίληψη στα ελληνικά σε 3-5 σημεία:",
@@ -437,7 +637,7 @@ def generate_summary(text: str, endpoint: str, token: str, model: str, language:
             "max_tokens": 1024
         }
         
-        response = requests.post(url, headers=headers, json=payload, timeout=120, verify=False)
+        response = session.post(url, headers=headers, json=payload, timeout=120)
         
         if response.status_code == 200:
             data = response.json()
@@ -501,6 +701,25 @@ def render_header():
         if st.session_state.is_processing:
             st.markdown('<span class="live-indicator">● PROCESSING</span>', unsafe_allow_html=True)
 
+def handle_whisper_url_change():
+    """Callback to auto-connect when URL changes."""
+    if st.session_state.whisper_endpoint:
+        with st.spinner("Detecting model..."):
+            endpoint = normalize_endpoint(st.session_state.whisper_endpoint, "http")
+            # Force cache refresh if URL changed
+            fetch_whisper_models.clear()
+            models, error = fetch_whisper_models(endpoint)
+
+            # Auto connect if we found something
+            if models:
+                st.session_state.whisper_connected = True
+                st.session_state.whisper_models = models
+                st.session_state.selected_whisper_model = models[0]
+                if not error:
+                    st.toast(f"✅ Found {models[0]}")
+            else:
+                st.session_state.whisper_connected = False
+                st.toast(f"⚠️ {error}")
 
 def render_sidebar():
     with st.sidebar:
@@ -510,35 +729,25 @@ def render_sidebar():
         st.subheader("🎤 Whisper (STT)")
         st.caption("Internal cluster address • No token")
         
-        st.session_state.whisper_endpoint = st.text_input(
+        # We use on_change to trigger detection immediately
+        new_endpoint = st.text_input(
             "Whisper Endpoint",
             value=st.session_state.whisper_endpoint,
             placeholder="http://whisper-xxx.namespace.svc.cluster.local:9000",
-            help="Internal K8s service address (port 9000)"
+            help="Internal K8s service address (port 9000)",
+            key="whisper_endpoint_input"
         )
         
-        if st.button("🔌 Connect Whisper", use_container_width=True):
-            if st.session_state.whisper_endpoint:
-                with st.spinner("Connecting..."):
-                    endpoint = normalize_endpoint(st.session_state.whisper_endpoint, "http")
-                    models, error = fetch_whisper_models(endpoint)
-                    
-                    # Always mark as connected if endpoint exists
-                    st.session_state.whisper_connected = True
-                    
-                    if models:
-                        st.session_state.whisper_models = models
-                        st.session_state.selected_whisper_model = models[0]
-                        st.success(f"✅ Connected! {len(models)} models")
-                    else:
-                        # Use default model
-                        st.session_state.whisper_models = ['whisper-large-v3']
-                        st.session_state.selected_whisper_model = 'whisper-large-v3'
-                        st.success(f"✅ Connected (using default model)")
-                        if error:
-                            st.caption(f"Note: {error}")
-            else:
-                st.error("Enter Whisper endpoint")
+        # Check if URL changed
+        if new_endpoint != st.session_state.whisper_endpoint:
+            st.session_state.whisper_endpoint = new_endpoint
+            handle_whisper_url_change()
+            st.rerun()
+
+        # Connect button (Manual trigger)
+        if st.button("🔌 Connect / Refresh", use_container_width=True):
+            handle_whisper_url_change()
+            st.rerun()
         
         if st.session_state.whisper_models:
             st.session_state.selected_whisper_model = st.selectbox(
@@ -615,6 +824,14 @@ def render_sidebar():
             'do_summary': do_summary
         }
 
+def render_debug_logs():
+    with st.expander("🐛 Debug Logs", expanded=False):
+        if st.button("Clear Logs"):
+            st.session_state.debug_logs = []
+            st.rerun()
+
+        logs = "\n".join(reversed(st.session_state.get('debug_logs', [])))
+        st.code(logs, language="text")
 
 def render_metrics():
     if not st.session_state.transcript:
@@ -887,6 +1104,7 @@ def main():
     
     with tab1:
         render_main(options)
+        render_debug_logs()
     with tab2:
         render_history()
     with tab3:
